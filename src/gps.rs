@@ -1,4 +1,7 @@
-use mavlink::common::{MavMessage, PositionTargetTypemask, SET_POSITION_TARGET_GLOBAL_INT_DATA};
+use mavlink::common::{
+    MavCmd, MavMessage, MavMode, PositionTargetTypemask, COMMAND_LONG_DATA, SET_MODE_DATA,
+    SET_POSITION_TARGET_GLOBAL_INT_DATA,
+};
 use mavlink::error::MessageReadError;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
@@ -126,4 +129,70 @@ pub fn send_guided_target(target_lat: f64, target_lon: f64, alt_m: f32) -> Resul
     link.send(&header, &set_pos_msg)
         .map(|_| ())
         .map_err(|error| format!("could not send guided target: {error}"))
+}
+
+/// Selects ArduCopter Guided mode for Drone 1.
+pub fn set_guided_mode() -> Result<(), String> {
+    let link = control_link()?;
+    let header = control_header();
+    let message = MavMessage::SET_MODE(SET_MODE_DATA {
+        target_system: 1,
+        base_mode: MavMode::MAV_MODE_GUIDED_DISARMED,
+        // ArduCopter's custom mode number for Guided.
+        custom_mode: 4,
+    });
+
+    link.send(&header, &message)
+        .map(|_| ())
+        .map_err(|error| format!("could not select Guided mode: {error}"))
+}
+
+/// Arms Drone 1 using the MAVLink arm/disarm command.
+pub fn arm_throttle() -> Result<(), String> {
+    send_command(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0)
+        .map_err(|error| format!("could not arm throttle: {error}"))
+}
+
+/// Commands Drone 1 to take off to a relative altitude in metres.
+pub fn takeoff(altitude_m: f32) -> Result<(), String> {
+    send_command(MavCmd::MAV_CMD_NAV_TAKEOFF, 0.0, altitude_m)
+        .map_err(|error| format!("could not command takeoff: {error}"))
+}
+
+fn control_link() -> Result<Box<dyn mavlink::MavConnection<MavMessage> + Send>, String> {
+    let mut link = mavlink::connect::<MavMessage>("tcpout:127.0.0.1:5760").map_err(|error| {
+        format!("could not connect to Drone 1 control endpoint (5760): {error}")
+    })?;
+    link.set_protocol_version(mavlink::MavlinkVersion::V2);
+    Ok(link)
+}
+
+fn control_header() -> mavlink::MavHeader {
+    mavlink::MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: 0,
+    }
+}
+
+fn send_command(command: MavCmd, param1: f32, param7: f32) -> Result<(), String> {
+    let link = control_link()?;
+    let header = control_header();
+    let message = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: 1,
+        target_component: 1,
+        command,
+        confirmation: 0,
+        param1,
+        param2: 0.0,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7,
+    });
+
+    link.send(&header, &message)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }

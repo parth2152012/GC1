@@ -92,6 +92,9 @@ async fn main() {
         println!("\n==================================================");
         println!("🎮 SWARM OPERATOR COMMAND TERMINAL ONLINE");
         println!("Commands:");
+        println!("  mode guided                     -> Set Drone 1 to Guided mode");
+        println!("  arm throttle                    -> Arm Drone 1");
+        println!("  takeoff <alt_m>                 -> Take off Drone 1 to altitude");
         println!("  poi <north_m> <east_m> <alt_m>  -> Send drone to local waypoint offset");
         println!("  snap OR image                   -> Capture camera snapshot");
         println!("  status                          -> Display fleet telemetry");
@@ -123,6 +126,34 @@ async fn main() {
             }
 
             match parts[0].to_lowercase().as_str() {
+                "mode" if parts.len() == 2 && parts[1].eq_ignore_ascii_case("guided") => {
+                    match gps::set_guided_mode() {
+                        Ok(()) => println!("✅ Drone 1 set to Guided mode."),
+                        Err(error) => eprintln!("❌ Could not set Guided mode: {error}"),
+                    }
+                }
+                "mode" => println!("❌ Usage: mode guided"),
+                "arm" if parts.len() == 2 && parts[1].eq_ignore_ascii_case("throttle") => {
+                    match gps::arm_throttle() {
+                        Ok(()) => println!("✅ Drone 1 arm command sent."),
+                        Err(error) => eprintln!("❌ Could not arm Drone 1: {error}"),
+                    }
+                }
+                "arm" => println!("❌ Usage: arm throttle"),
+                "takeoff" => {
+                    let altitude_m = parts.get(1).and_then(|value| value.parse::<f32>().ok());
+                    if parts.len() != 2
+                        || !matches!(altitude_m, Some(value) if (0.0..=120.0).contains(&value))
+                    {
+                        println!("❌ Usage: takeoff <alt_m> (altitude must be within 0..=120m)");
+                        continue;
+                    }
+
+                    match gps::takeoff(altitude_m.expect("altitude was validated")) {
+                        Ok(()) => println!("✅ Drone 1 takeoff command sent."),
+                        Err(error) => eprintln!("❌ Could not command takeoff: {error}"),
+                    }
+                }
                 "poi" => {
                     if parts.len() == 4 {
                         let north_m: Option<f64> = parts[1].parse().ok();
@@ -186,7 +217,7 @@ async fn main() {
                     println!("------------------------------\n");
                 }
                 "help" => {
-                    println!("Commands: poi <north_m> <east_m> <alt_m> | snap | status | help");
+                    println!("Commands: mode guided | arm throttle | takeoff <alt_m> | poi <north_m> <east_m> <alt_m> | snap | status | help");
                 }
                 _ => {
                     println!(
