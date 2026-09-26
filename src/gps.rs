@@ -1,6 +1,5 @@
 use mavlink::common::{MavMessage, PositionTargetTypemask, SET_POSITION_TARGET_GLOBAL_INT_DATA};
 use mavlink::error::MessageReadError;
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
 
@@ -86,11 +85,17 @@ fn listen_mavlink(
     }
 }
 
-pub fn send_guided_target(target_lat: f64, target_lon: f64, alt_m: f32) {
-    let socket = match UdpSocket::bind("127.0.0.1:0") {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+/// Sends a guided target through ArduPilot SITL's TCP MAVLink endpoint.
+///
+/// The UDP telemetry ports are one-way `--out` destinations used by the listeners,
+/// so writing a command back to them only sends it to another local UDP socket. SITL
+/// exposes a bidirectional MAVLink TCP endpoint on 5760 (instance 0), which is the
+/// control path used here.
+pub fn send_guided_target(target_lat: f64, target_lon: f64, alt_m: f32) -> Result<(), String> {
+    let mut link = mavlink::connect::<MavMessage>("tcpout:127.0.0.1:5760").map_err(|error| {
+        format!("could not connect to Drone 1 control endpoint (5760): {error}")
+    })?;
+    link.set_protocol_version(mavlink::MavlinkVersion::V2);
 
     let header = mavlink::MavHeader {
         system_id: 255,
@@ -118,8 +123,7 @@ pub fn send_guided_target(target_lat: f64, target_lon: f64, alt_m: f32) {
             yaw_rate: 0.0,
         });
 
-    let mut buffer = Vec::new();
-    if mavlink::write_v2_msg(&mut buffer, header, &set_pos_msg).is_ok() {
-        let _ = socket.send_to(&buffer, "127.0.0.1:14550");
-    }
+    link.send(&header, &set_pos_msg)
+        .map(|_| ())
+        .map_err(|error| format!("could not send guided target: {error}"))
 }

@@ -1,16 +1,19 @@
 """Capture JPEG frames and send application-level UDP fragments to UVAX-1."""
 import cv2
 import socket
-import time
+import select
 import math
 import struct
 
 RUST_IPC_PORT = 5001
+CAMERA_CONTROL_PORT = 5002
 MAX_DATAGRAM_BYTES = 1400
-# 16-byte frame header: magic, frame id, chunk index, chunk count.
+# 12-byte frame header: magic, frame id, chunk index, chunk count.
 HEADER = struct.Struct("!4sIHH")
 MAX_CHUNK_BYTES = MAX_DATAGRAM_BYTES - HEADER.size
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+control.bind(("127.0.0.1", CAMERA_CONTROL_PORT))
 cap = cv2.VideoCapture(0)
 frame_id = 0
 
@@ -39,13 +42,20 @@ def send_frame(payload):
 
 try:
     while True:
+        readable, _, _ = select.select([control], [], [], 1.0)
+        if not readable:
+            continue
+        command, _ = control.recvfrom(32)
+        if command.strip().upper() != b"SNAP":
+            continue
         ret, frame = cap.read()
-        if ret:
-            resized = cv2.resize(frame, (640, 480))
-            ok, encoded = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 65])
-            if ok:
-                send_frame(encoded.tobytes())
-        time.sleep(0.05)
+        if not ret:
+            continue
+        resized = cv2.resize(frame, (640, 480))
+        ok, encoded = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        if ok:
+            send_frame(encoded.tobytes())
 finally:
     cap.release()
+    control.close()
     sock.close()

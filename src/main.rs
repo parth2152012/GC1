@@ -87,6 +87,117 @@ async fn main() {
         network::start_routing_mesh().await;
     });
 
+    // Start accepting commands immediately; target commands still validate GPS lock.
+    let cli = tokio::spawn(async {
+        println!("\n==================================================");
+        println!("🎮 SWARM OPERATOR COMMAND TERMINAL ONLINE");
+        println!("Commands:");
+        println!("  poi <north_m> <east_m> <alt_m>  -> Send drone to local waypoint offset");
+        println!("  snap OR image                   -> Capture camera snapshot");
+        println!("  status                          -> Display fleet telemetry");
+        println!("  help                            -> Display command menu");
+        println!("==================================================\n");
+
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin).lines();
+
+        loop {
+            print!("swarm-cli> ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+
+            let line = match reader.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    println!("\nCLI input closed; shutting down command terminal.");
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("\nCLI input error: {error}");
+                    break;
+                }
+            };
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+
+            match parts[0].to_lowercase().as_str() {
+                "poi" => {
+                    if parts.len() == 4 {
+                        let north_m: Option<f64> = parts[1].parse().ok();
+                        let east_m: Option<f64> = parts[2].parse().ok();
+                        let alt_m: Option<f32> = parts[3].parse().ok();
+
+                        if let (Some(n), Some(e), Some(a)) = (north_m, east_m, alt_m) {
+                            let cur_lat = gps::LATITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
+                            let cur_lon = gps::LONGITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
+
+                            if n.abs() > GEOFENCE_HALF_EXTENT_M
+                                || e.abs() > GEOFENCE_HALF_EXTENT_M
+                                || !(0.0..=120.0).contains(&a)
+                                || cur_lat == 0.0
+                                || cur_lon == 0.0
+                            {
+                                println!("❌ Target rejected: wait for GPS lock and keep offsets within the 1000m geofence and altitude within 0..=120m.");
+                                continue;
+                            }
+                            let (target_lat, target_lon) = target_from_enu(cur_lat, cur_lon, n, e);
+
+                            match gps::send_guided_target(target_lat, target_lon, a) {
+                                    Ok(()) => println!(
+                                        "🎯 Dispatched target: North {n}m, East {e}m (Lat {target_lat:.6}, Lon {target_lon:.6}, Alt {a}m)"
+                                    ),
+                                    Err(error) => eprintln!("❌ Target dispatch failed: {error}"),
+                                }
+                        } else {
+                            println!(
+                                "❌ Usage: poi <north_m> <east_m> <alt_m> (e.g., poi 20 10 15)"
+                            );
+                        }
+                    } else {
+                        println!("❌ Usage: poi <north_m> <east_m> <alt_m>");
+                    }
+                }
+                "snap" | "image" => {
+                    println!("📸 TRIGGERING CAMERA SNAPSHOT CAPTURE...");
+                    if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
+                        let _ = socket.send_to(b"SNAP", "127.0.0.1:5002");
+                    }
+                }
+                "status" => {
+                    let lat1 = gps::LATITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
+                    let lon1 = gps::LONGITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
+                    let bat1 = gps::BATTERY_1.load(Ordering::Acquire);
+
+                    let lat2 = gps::LATITUDE_2.load(Ordering::Acquire) as f64 / 1e7;
+                    let lon2 = gps::LONGITUDE_2.load(Ordering::Acquire) as f64 / 1e7;
+                    let bat2 = gps::BATTERY_2.load(Ordering::Acquire);
+
+                    println!("\n--- FLEET TELEMETRY STATUS ---");
+                    println!(
+                        "🛸 Drone 1: Pos ({:.6}, {:.6}) | Bat: {}%",
+                        lat1, lon1, bat1
+                    );
+                    println!(
+                        "🛸 Drone 2: Pos ({:.6}, {:.6}) | Bat: {}%",
+                        lat2, lon2, bat2
+                    );
+                    println!("------------------------------\n");
+                }
+                "help" => {
+                    println!("Commands: poi <north_m> <east_m> <alt_m> | snap | status | help");
+                }
+                _ => {
+                    println!(
+                        "❓ Unknown command: '{}'. Type 'help' for available commands.",
+                        parts[0]
+                    );
+                }
+            }
+        }
+    });
+
     // Dynamic non-blocking lock check
     poll_for_gps_lock().await;
 
@@ -190,104 +301,6 @@ async fn main() {
             }
 
             sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    let cli = tokio::spawn(async {
-        println!("\n==================================================");
-        println!("🎮 SWARM OPERATOR COMMAND TERMINAL ONLINE");
-        println!("Commands:");
-        println!("  poi <north_m> <east_m> <alt_m>  -> Send drone to local waypoint offset");
-        println!("  snap OR image                   -> Capture camera snapshot");
-        println!("  status                          -> Display fleet telemetry");
-        println!("  help                            -> Display command menu");
-        println!("==================================================\n");
-
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin).lines();
-
-        loop {
-            print!("swarm-cli> ");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-
-            if let Ok(Some(line)) = reader.next_line().await {
-                let parts: Vec<&str> = line.trim().split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-
-                match parts[0].to_lowercase().as_str() {
-                    "poi" => {
-                        if parts.len() == 4 {
-                            let north_m: Option<f64> = parts[1].parse().ok();
-                            let east_m: Option<f64> = parts[2].parse().ok();
-                            let alt_m: Option<f32> = parts[3].parse().ok();
-
-                            if let (Some(n), Some(e), Some(a)) = (north_m, east_m, alt_m) {
-                                let cur_lat = gps::LATITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
-                                let cur_lon = gps::LONGITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
-
-                                if n.abs() > GEOFENCE_HALF_EXTENT_M
-                                    || e.abs() > GEOFENCE_HALF_EXTENT_M
-                                    || !(0.0..=120.0).contains(&a)
-                                    || cur_lat == 0.0
-                                    || cur_lon == 0.0
-                                {
-                                    println!("❌ Target rejected: wait for GPS lock and keep offsets within the 1000m geofence and altitude within 0..=120m.");
-                                    continue;
-                                }
-                                let (target_lat, target_lon) =
-                                    target_from_enu(cur_lat, cur_lon, n, e);
-
-                                println!("🎯 DISPATCHING Target Offset: North {}m, East {}m (Lat {:.6}, Lon {:.6}, Alt {}m)", n, e, target_lat, target_lon, a);
-                                gps::send_guided_target(target_lat, target_lon, a);
-                            } else {
-                                println!(
-                                    "❌ Usage: poi <north_m> <east_m> <alt_m> (e.g., poi 20 10 15)"
-                                );
-                            }
-                        } else {
-                            println!("❌ Usage: poi <north_m> <east_m> <alt_m>");
-                        }
-                    }
-                    "snap" | "image" => {
-                        println!("📸 TRIGGERING CAMERA SNAPSHOT CAPTURE...");
-                        if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
-                            let _ = socket.send_to(b"SNAP", "127.0.0.1:5001");
-                        }
-                    }
-                    "status" => {
-                        let lat1 = gps::LATITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
-                        let lon1 = gps::LONGITUDE_1.load(Ordering::Acquire) as f64 / 1e7;
-                        let bat1 = gps::BATTERY_1.load(Ordering::Acquire);
-
-                        let lat2 = gps::LATITUDE_2.load(Ordering::Acquire) as f64 / 1e7;
-                        let lon2 = gps::LONGITUDE_2.load(Ordering::Acquire) as f64 / 1e7;
-                        let bat2 = gps::BATTERY_2.load(Ordering::Acquire);
-
-                        println!("\n--- FLEET TELEMETRY STATUS ---");
-                        println!(
-                            "🛸 Drone 1: Pos ({:.6}, {:.6}) | Bat: {}%",
-                            lat1, lon1, bat1
-                        );
-                        println!(
-                            "🛸 Drone 2: Pos ({:.6}, {:.6}) | Bat: {}%",
-                            lat2, lon2, bat2
-                        );
-                        println!("------------------------------\n");
-                    }
-                    "help" => {
-                        println!("Commands: poi <north_m> <east_m> <alt_m> | snap | status | help");
-                    }
-                    _ => {
-                        println!(
-                            "❓ Unknown command: '{}'. Type 'help' for available commands.",
-                            parts[0]
-                        );
-                    }
-                }
-            }
         }
     });
 
