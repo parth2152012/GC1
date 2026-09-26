@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
+import shlex
 import sys
 import subprocess
 import time
+from shutil import which
 
-ARDUPILOT_DIR = "/home/kali/ardupilot"
-RUST_APP_DIR = "/home/kali/GC1"
+DEFAULT_ARDUPILOT_DIR = str(Path.home() / "ardupilot")
+RUST_APP_DIR = Path(__file__).resolve().parent
+DRONE_SEPARATION_M = 5
 
 
 def cleanup():
@@ -29,6 +33,23 @@ def main():
     default_lat = 19.0760
     default_lon = 72.8777
 
+    ardupilot_input = input(
+        f"Enter ArduPilot directory [{DEFAULT_ARDUPILOT_DIR}]: "
+    ).strip()
+    ardupilot_dir = Path(ardupilot_input or DEFAULT_ARDUPILOT_DIR).expanduser()
+    if not (ardupilot_dir / "Tools/autotest/sim_vehicle.py").is_file():
+        print(f"❌ ArduPilot sim_vehicle.py not found under {ardupilot_dir}")
+        return
+
+    try:
+        drone_input = input("Enter number of drones [2]: ").strip()
+        drone_count = int(drone_input) if drone_input else 2
+        if drone_count < 1:
+            raise ValueError
+    except ValueError:
+        print("❌ Drone count must be a positive whole number.")
+        return
+
     try:
         lat_input = input(f"Enter Origin Latitude [{default_lat}]: ").strip()
         lat1 = float(lat_input) if lat_input else default_lat
@@ -39,46 +60,31 @@ def main():
         print("❌ Invalid input. Falling back to defaults.")
         lat1, lon1 = default_lat, default_lon
 
-    # Add ~10m offset North for Drone 2
-    lat2 = lat1 + (10 * 0.000009)
-    lon2 = lon1
-
-    print(f"\n🚀 Launching Drone 1 at: {lat1:.6f}, {lon1:.6f}")
-    print(f"🚀 Launching Drone 2 at: {lat2:.6f}, {lon2:.6f} (+10m North)")
+    print(f"\n🚀 Launching {drone_count} drone(s) with {DRONE_SEPARATION_M}m north/south separation.")
+    for index in range(drone_count):
+        drone_lat = lat1 + (index * DRONE_SEPARATION_M * 0.000009)
+        print(f"🚀 Launching Drone {index + 1} at: {drone_lat:.6f}, {lon1:.6f}")
     print("==================================================\n")
-
-    cmd_drone1 = (
-        f"cd {ARDUPILOT_DIR}/ArduCopter && "
-        f"python3 {ARDUPILOT_DIR}/Tools/autotest/sim_vehicle.py "
-        f"-v ArduCopter -I 0 --console --map "
-        f"--out=udp:127.0.0.1:14550 "
-        f"--custom-location={lat1},{lon1},0,0 "
-        f"--no-rebuild --wipe-eeprom"
-    )
-
-    cmd_drone2 = (
-        f"cd {ARDUPILOT_DIR}/ArduCopter && "
-        f"python3 {ARDUPILOT_DIR}/Tools/autotest/sim_vehicle.py "
-        f"-v ArduCopter -I 1 --console --map "
-        f"--out=udp:127.0.0.1:14560 "
-        f"--custom-location={lat2},{lon2},0,0 "
-        f"--no-rebuild --wipe-eeprom"
-    )
 
     print("🖥️  Opening SITL Drone Instances in dedicated terminals...")
 
-    # Try spawning in x-terminal-emulator or qterminal
-    try:
-        subprocess.Popen(["qterminal", "-e", f"bash -c '{cmd_drone1}; exec bash'"])
-        subprocess.Popen(["qterminal", "-e", f"bash -c '{cmd_drone2}; exec bash'"])
-    except FileNotFoundError:
-        # Fallback to standard xterm / default system terminal if qterminal isn't present
-        subprocess.Popen(
-            ["x-terminal-emulator", "-e", f"bash -c '{cmd_drone1}; exec bash'"]
+    # Prefer qterminal, with the desktop-provided terminal as a fallback.
+    terminal = "qterminal" if which("qterminal") else "x-terminal-emulator"
+    if not which(terminal):
+        print("❌ No supported graphical terminal was found (qterminal or x-terminal-emulator).")
+        return
+
+    for index in range(drone_count):
+        drone_lat = lat1 + (index * DRONE_SEPARATION_M * 0.000009)
+        telemetry_port = 14550 + (index * 10)
+        command = (
+            f"cd {shlex.quote(str(ardupilot_dir / 'ArduCopter'))} && "
+            f"python3 {shlex.quote(str(ardupilot_dir / 'Tools/autotest/sim_vehicle.py'))} "
+            f"-v ArduCopter -I {index} --sysid {index + 1} --console --map "
+            f"--out=udp:127.0.0.1:{telemetry_port} "
+            f"--custom-location={drone_lat},{lon1},0,0 --no-rebuild --wipe-eeprom"
         )
-        subprocess.Popen(
-            ["x-terminal-emulator", "-e", f"bash -c '{cmd_drone2}; exec bash'"]
-        )
+        subprocess.Popen([terminal, "-e", f"bash -c {shlex.quote(command + '; exec bash')}"])
 
     print("⚡ Starting Rust Swarm Controller...\n")
     os.chdir(RUST_APP_DIR)

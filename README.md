@@ -28,7 +28,7 @@ cd /path/to/GC1
 python3 deploy_swarm.py
 ```
 
-Enter an origin when prompted, or press Enter to use the Mumbai default. The launcher supplies telemetry on UDP ports 14550 and 14560. Drone 1's normal SITL MAVLink TCP port 5760 is reserved for CLI control commands.
+The launcher prompts for the ArduPilot checkout (press Enter for `~/ardupilot`), the drone count, and an origin. Drones are placed 5 m apart north/south; their telemetry ports begin at UDP 14550 and increase by 10 per drone. The controller currently displays telemetry for the first two drones. Drone 1's normal SITL MAVLink TCP port 5760 is reserved for CLI control commands.
 
 To also enable `snap`, start the camera producer in another terminal before running the controller:
 
@@ -44,7 +44,7 @@ The prompt appears immediately after the controller boots. `poi` remains unavail
 
 ```text
 swarm-cli> help
-Commands: poi <north_m> <east_m> <alt_m> | snap | status | help
+Commands: mode guided | arm throttle | takeoff <alt_m> | poi <north_m> <east_m> <alt_m> | snap | status | help
 
 swarm-cli> status
 --- FLEET TELEMETRY STATUS ---
@@ -63,16 +63,19 @@ swarm-cli> snap
 | Command | Description |
 | --- | --- |
 | `poi <north_m> <east_m> <alt_m>` | Sends Drone 1 a global-relative-altitude MAVLink target. The vehicle must be armed and in Guided mode; offsets are relative to Drone 1's current position. |
+| `mode guided` | Sets Drone 1 to ArduCopter Guided mode. |
+| `arm throttle` | Arms Drone 1. Complete pre-arm checks and use this only in a safe SITL/test environment. |
+| `takeoff <alt_m>` | Commands Drone 1 to take off to a 0–120 m relative altitude. |
 | `status` | Prints the latest position and battery values from both telemetry streams. |
 | `snap` / `image` | Requests one JPEG frame from `camera.py`. The producer fragments it for the Rust listener. |
 | `help` | Prints the command summary. |
 
-To fly a waypoint in SITL, set Drone 1 to Guided mode and arm/take off in its MAVProxy console first:
+The CLI now provides the equivalent MAVProxy flight setup commands:
 
 ```text
-MAV> mode guided
-MAV> arm throttle
-MAV> takeoff 15
+swarm-cli> mode guided
+swarm-cli> arm throttle
+swarm-cli> takeoff 15
 ```
 
 ## Development checks
