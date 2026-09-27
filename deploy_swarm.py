@@ -10,6 +10,7 @@ from shutil import which
 DEFAULT_ARDUPILOT_DIR = str(Path.home() / "ardupilot")
 RUST_APP_DIR = Path(__file__).resolve().parent
 DRONE_SEPARATION_M = 5
+CONTROL_PORT_BASE = 14600
 
 
 def cleanup():
@@ -78,11 +79,13 @@ def main():
     for index in range(drone_count):
         drone_lat = lat1 + (index * DRONE_SEPARATION_M * 0.000009)
         telemetry_port = 14550 + (index * 10)
+        control_port = CONTROL_PORT_BASE + index
         command = (
             f"cd {shlex.quote(str(ardupilot_dir / 'ArduCopter'))} && "
             f"python3 {shlex.quote(str(ardupilot_dir / 'Tools/autotest/sim_vehicle.py'))} "
             f"-v ArduCopter -I {index} --sysid {index + 1} --console --map "
             f"--out=udp:127.0.0.1:{telemetry_port} "
+            f"--out=tcpin:127.0.0.1:{control_port} "
             f"--custom-location={drone_lat},{lon1},0,0 --no-rebuild --wipe-eeprom"
         )
         subprocess.Popen([terminal, "-e", f"bash -c {shlex.quote(command + '; exec bash')}"])

@@ -5,6 +5,11 @@ use mavlink::common::{
 use mavlink::error::MessageReadError;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
+use tokio::time::sleep;
+
+const DEFAULT_CONTROL_PORT_BASE: u16 = 14600;
+const COMMAND_SETTLE_DELAY: Duration = Duration::from_millis(500);
+const ARM_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 pub static LATITUDE_1: AtomicI32 = AtomicI32::new(0);
 pub static LONGITUDE_1: AtomicI32 = AtomicI32::new(0);
@@ -88,17 +93,14 @@ fn listen_mavlink(
     }
 }
 
-/// Sends a guided target through ArduPilot SITL's TCP MAVLink endpoint.
+/// Sends a guided target through MAVProxy's dedicated bidirectional TCP output.
 ///
 /// The UDP telemetry ports are one-way `--out` destinations used by the listeners,
 /// so writing a command back to them only sends it to another local UDP socket. SITL
-/// exposes a bidirectional MAVLink TCP endpoint on 5760 (instance 0), which is the
-/// control path used here.
+/// also has a single-client TCP endpoint already occupied by MAVProxy. The launcher
+/// therefore exposes separate MAVProxy `tcpin` outputs starting at port 14600.
 pub fn send_guided_target(target_lat: f64, target_lon: f64, alt_m: f32) -> Result<(), String> {
-    let mut link = mavlink::connect::<MavMessage>("tcpout:127.0.0.1:5760").map_err(|error| {
-        format!("could not connect to Drone 1 control endpoint (5760): {error}")
-    })?;
-    link.set_protocol_version(mavlink::MavlinkVersion::V2);
+    let link = control_link()?;
 
     let header = mavlink::MavHeader {
         system_id: 255,
@@ -160,11 +162,7 @@ pub fn takeoff(altitude_m: f32) -> Result<(), String> {
 }
 
 fn control_link() -> Result<Box<dyn mavlink::MavConnection<MavMessage> + Send>, String> {
-    let mut link = mavlink::connect::<MavMessage>("tcpout:127.0.0.1:5760").map_err(|error| {
-        format!("could not connect to Drone 1 control endpoint (5760): {error}")
-    })?;
-    link.set_protocol_version(mavlink::MavlinkVersion::V2);
-    Ok(link)
+    control_link_for(1)
 }
 
 fn control_header() -> mavlink::MavHeader {
@@ -198,28 +196,30 @@ fn send_command(command: MavCmd, param1: f32, param7: f32) -> Result<(), String>
 }
 
 // ---------------------------------------------------------------------------------
-// FIX: the functions above only ever command Drone 1 (hardcoded TCP 5760, sysid 1).
+// FIX: the functions above only ever command Drone 1 (hardcoded endpoint, sysid 1).
 // That meant that once WaveManager promoted the reserve (Drone 2) to LeadSurveyor,
 // nothing in the codebase could actually fly it — the "relay handoff" was only a
-// role label, never a real command. ArduPilot SITL's convention is that instance N
-// exposes its MAVLink TCP endpoint on port 5760 + 10*N and defaults to system_id
-// N+1, matching the existing telemetry port pattern (14550 + 10*N). The functions
-// below generalize control to any drone_id so the mission-dispatch loop in main.rs
-// can command whichever node currently holds the LeadSurveyor role.
+// role label, never a real command. The functions below route each system ID through
+// its corresponding MAVProxy TCP output so the mission-dispatch loop in main.rs can
+// command whichever node currently holds the LeadSurveyor role.
 // ---------------------------------------------------------------------------------
 
-fn control_port_for(drone_id: u8) -> u16 {
-    5760 + (drone_id.saturating_sub(1) as u16) * 10
+fn control_endpoint_for(drone_id: u8) -> String {
+    let base = std::env::var("GC1_CONTROL_PORT_BASE")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_CONTROL_PORT_BASE);
+    let port = base + drone_id.saturating_sub(1) as u16;
+    format!("tcpout:127.0.0.1:{port}")
 }
 
 fn control_link_for(
     drone_id: u8,
 ) -> Result<Box<dyn mavlink::MavConnection<MavMessage> + Send>, String> {
-    let port = control_port_for(drone_id);
-    let mut link =
-        mavlink::connect::<MavMessage>(&format!("tcpout:127.0.0.1:{port}")).map_err(|error| {
-            format!("could not connect to Drone {drone_id} control endpoint ({port}): {error}")
-        })?;
+    let endpoint = control_endpoint_for(drone_id);
+    let mut link = mavlink::connect::<MavMessage>(&endpoint).map_err(|error| {
+        format!("could not connect to Drone {drone_id} control endpoint ({endpoint}): {error}")
+    })?;
     link.set_protocol_version(mavlink::MavlinkVersion::V2);
     Ok(link)
 }
@@ -291,6 +291,41 @@ pub fn takeoff_for(drone_id: u8, altitude_m: f32) -> Result<(), String> {
         .map_err(|error| format!("could not command takeoff for drone {drone_id}: {error}"))
 }
 
+fn relative_altitude_mm_for(drone_id: u8) -> i32 {
+    match drone_id {
+        1 => ALTITUDE_1_MM.load(Ordering::Acquire),
+        2 => ALTITUDE_2_MM.load(Ordering::Acquire),
+        _ => 0,
+    }
+}
+
+/// Select Guided mode, arm, and initiate takeoff in the order ArduCopter requires.
+pub async fn prepare_and_takeoff_for(drone_id: u8, altitude_m: f32) -> Result<(), String> {
+    set_guided_mode_for(drone_id)?;
+    sleep(COMMAND_SETTLE_DELAY).await;
+    arm_throttle_for(drone_id)?;
+    sleep(ARM_SETTLE_DELAY).await;
+    takeoff_for(drone_id, altitude_m)
+}
+
+/// Ensure a grounded aircraft takes off before dispatching its PoI target.
+pub async fn prepare_and_send_guided_target_for(
+    drone_id: u8,
+    target_lat: f64,
+    target_lon: f64,
+    alt_m: f32,
+) -> Result<(), String> {
+    set_guided_mode_for(drone_id)?;
+    sleep(COMMAND_SETTLE_DELAY).await;
+    if relative_altitude_mm_for(drone_id) < 2_000 {
+        arm_throttle_for(drone_id)?;
+        sleep(ARM_SETTLE_DELAY).await;
+        takeoff_for(drone_id, alt_m)?;
+        sleep(Duration::from_secs(2)).await;
+    }
+    send_guided_target_for(drone_id, target_lat, target_lon, alt_m)
+}
+
 fn send_command_for(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> Result<(), String> {
     let link = control_link_for(drone_id)?;
     let header = control_header();
@@ -310,4 +345,16 @@ fn send_command_for(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> 
     link.send(&header, &message)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_endpoints_are_distinct_mavproxy_outputs() {
+        std::env::remove_var("GC1_CONTROL_PORT_BASE");
+        assert_eq!(control_endpoint_for(1), "tcpout:127.0.0.1:14600");
+        assert_eq!(control_endpoint_for(2), "tcpout:127.0.0.1:14601");
+    }
 }

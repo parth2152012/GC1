@@ -154,25 +154,28 @@ async fn try_assign_and_dispatch(
     else {
         return;
     };
-    let _ = mission_mgr.mark_poi_in_progress(mission_id, poi.id, node.id);
-    node.current_poi = Some(poi.id);
-    metrics::log_event(metrics::MetricEvent::PoiAssigned {
-        mission_id,
-        poi_id: poi.id,
-        drone_id: node.id,
-    })
-    .await;
-
     let (target_lat, target_lon) = target_from_enu(origin_lat, origin_lon, poi.north_m, poi.east_m);
-    match gps::send_guided_target_for(node.id, target_lat, target_lon, poi.alt_m) {
+    match gps::prepare_and_send_guided_target_for(node.id, target_lat, target_lon, poi.alt_m).await
+    {
         Ok(()) => {
+            let _ = mission_mgr.mark_poi_in_progress(mission_id, poi.id, node.id);
+            node.current_poi = Some(poi.id);
             node.airborne_since.get_or_insert(Instant::now());
+            metrics::log_event(metrics::MetricEvent::PoiAssigned {
+                mission_id,
+                poi_id: poi.id,
+                drone_id: node.id,
+            })
+            .await;
             println!(
                 "\n🎯 Auto-dispatched Drone {} to PoI #{} (priority {:?}) at N{:.0}m E{:.0}m",
                 node.id, poi.id, poi.priority, poi.north_m, poi.east_m
             )
         }
-        Err(error) => eprintln!("\n❌ Auto-dispatch to PoI #{} failed: {error}", poi.id),
+        Err(error) => {
+            let _ = mission_mgr.release_stalled_poi(mission_id, poi.id);
+            eprintln!("\n❌ Auto-dispatch to PoI #{} failed: {error}", poi.id);
+        }
     }
 }
 
@@ -359,7 +362,12 @@ async fn main() {
                         continue;
                     }
 
-                    match gps::takeoff(altitude_m.expect("altitude was validated")) {
+                    match gps::prepare_and_takeoff_for(
+                        1,
+                        altitude_m.expect("altitude was validated"),
+                    )
+                    .await
+                    {
                         Ok(()) => println!("✅ Drone 1 takeoff command sent."),
                         Err(error) => eprintln!("❌ Could not command takeoff: {error}"),
                     }
@@ -385,7 +393,7 @@ async fn main() {
                             }
                             let (target_lat, target_lon) = target_from_enu(cur_lat, cur_lon, n, e);
 
-                            match gps::send_guided_target(target_lat, target_lon, a) {
+                            match gps::prepare_and_send_guided_target_for(1, target_lat, target_lon, a).await {
                                     Ok(()) => println!(
                                         "🎯 Dispatched target: North {n}m, East {e}m (Lat {target_lat:.6}, Lon {target_lon:.6}, Alt {a}m)"
                                     ),

@@ -14,7 +14,7 @@ UVAX-1 is an async Rust controller for a two-node ArduCopter SITL swarm. It rece
 - **Measured metrics logging**: packet identities, send/receive timestamps, measured latency samples, mission progress, relay reallocations, recovery time, separation/link warnings, avoidance maneuvers, photo captures, mesh health, and fault injections are appended as JSON lines to `swarm_metrics.jsonl`.
 - **Fault injection for testing**: `fail battery <1|2> <percent>` and `fail link` / `recover` let you simulate a UAV or comms failure and measure recovery time.
 - GPS-gated `poi` commands, bounded to ±500 m north/east and 0–100 m relative altitude (matches the organizer's 100 m operational height cap).
-- A bidirectional MAVLink control route to each drone's SITL TCP endpoint (5760 + 10×instance).
+- A bidirectional MAVLink control route through dedicated MAVProxy TCP outputs (ports 14600, 14601, ...), avoiding contention with MAVProxy's own SITL connection.
 - On-demand camera snapshots: `snap` signals `camera.py` on `UDP 5002`; captured JPEG fragments are reassembled and **saved to `captures/frame_<id>.jpg`** (previously discarded).
 
 ## Requirements
@@ -68,10 +68,10 @@ swarm-cli> snap
 
 | Command | Description |
 | --- | --- |
-| `poi <north_m> <east_m> <alt_m>` | Manually sends Drone 1 a global-relative-altitude MAVLink target. |
+| `poi <north_m> <east_m> <alt_m>` | Sets Guided mode, arms/takes off if needed, then sends Drone 1 a global-relative-altitude target. |
 | `mode guided` | Sets Drone 1 to ArduCopter Guided mode. |
 | `arm throttle` | Arms Drone 1. Complete pre-arm checks and use this only in a safe SITL/test environment. |
-| `takeoff <alt_m>` | Commands Drone 1 to take off, 0–100 m relative altitude. |
+| `takeoff <alt_m>` | Sets Guided mode, arms Drone 1, then commands takeoff to 0–100 m relative altitude. |
 | `status` | Prints the latest position and battery values from both telemetry streams. |
 | `snap` / `image` | Requests one JPEG frame from `camera.py`, saved to `captures/`. |
 | `fail battery <1\|2> <percent>` | Injects a battery fault on a drone, for testing reconfiguration/recovery-time measurement. |
