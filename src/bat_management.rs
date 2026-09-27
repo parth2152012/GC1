@@ -1,4 +1,3 @@
-use crate::gps::BATTERY_1;
 use std::sync::atomic::Ordering;
 
 pub const RESERVE_DISPATCH_PERCENT: f32 = 45.0;
@@ -13,7 +12,14 @@ pub struct BatteryState {
 impl BatteryState {
     pub fn new() -> Self {
         Self {
-            percentage: BATTERY_1.load(Ordering::Acquire) as f32,
+            percentage: 100.0,
+            discharge_rate_per_min: 5.0,
+        }
+    }
+
+    pub fn from_telemetry(battery: &std::sync::atomic::AtomicU8) -> Self {
+        Self {
+            percentage: battery.load(Ordering::Acquire) as f32,
             discharge_rate_per_min: 5.0,
         }
     }

@@ -196,3 +196,118 @@ fn send_command(command: MavCmd, param1: f32, param7: f32) -> Result<(), String>
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
+
+// ---------------------------------------------------------------------------------
+// FIX: the functions above only ever command Drone 1 (hardcoded TCP 5760, sysid 1).
+// That meant that once WaveManager promoted the reserve (Drone 2) to LeadSurveyor,
+// nothing in the codebase could actually fly it — the "relay handoff" was only a
+// role label, never a real command. ArduPilot SITL's convention is that instance N
+// exposes its MAVLink TCP endpoint on port 5760 + 10*N and defaults to system_id
+// N+1, matching the existing telemetry port pattern (14550 + 10*N). The functions
+// below generalize control to any drone_id so the mission-dispatch loop in main.rs
+// can command whichever node currently holds the LeadSurveyor role.
+// ---------------------------------------------------------------------------------
+
+fn control_port_for(drone_id: u8) -> u16 {
+    5760 + (drone_id.saturating_sub(1) as u16) * 10
+}
+
+fn control_link_for(
+    drone_id: u8,
+) -> Result<Box<dyn mavlink::MavConnection<MavMessage> + Send>, String> {
+    let port = control_port_for(drone_id);
+    let mut link =
+        mavlink::connect::<MavMessage>(&format!("tcpout:127.0.0.1:{port}")).map_err(|error| {
+            format!("could not connect to Drone {drone_id} control endpoint ({port}): {error}")
+        })?;
+    link.set_protocol_version(mavlink::MavlinkVersion::V2);
+    Ok(link)
+}
+
+/// Same as `send_guided_target`, but for an arbitrary drone (by 1-based ID) instead
+/// of always Drone 1.
+pub fn send_guided_target_for(
+    drone_id: u8,
+    target_lat: f64,
+    target_lon: f64,
+    alt_m: f32,
+) -> Result<(), String> {
+    let link = control_link_for(drone_id)?;
+    let header = control_header();
+    let set_pos_msg =
+        MavMessage::SET_POSITION_TARGET_GLOBAL_INT(SET_POSITION_TARGET_GLOBAL_INT_DATA {
+            time_boot_ms: 0,
+            target_system: drone_id,
+            target_component: 1,
+            coordinate_frame: mavlink::common::MavFrame::MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            type_mask: PositionTargetTypemask::from_bits_truncate(0b0000111111111000),
+            lat_int: (target_lat * 1e7) as i32,
+            lon_int: (target_lon * 1e7) as i32,
+            alt: alt_m,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            afx: 0.0,
+            afy: 0.0,
+            afz: 0.0,
+            yaw: 0.0,
+            yaw_rate: 0.0,
+        });
+
+    link.send(&header, &set_pos_msg)
+        .map(|_| ())
+        .map_err(|error| format!("could not send guided target to drone {drone_id}: {error}"))
+}
+
+/// Same as `set_guided_mode`, but for an arbitrary drone.
+pub fn set_guided_mode_for(drone_id: u8) -> Result<(), String> {
+    let link = control_link_for(drone_id)?;
+    let header = control_header();
+    let message = MavMessage::SET_MODE(SET_MODE_DATA {
+        target_system: drone_id,
+        base_mode: MavMode::MAV_MODE_GUIDED_DISARMED,
+        custom_mode: 4,
+    });
+    link.send(&header, &message)
+        .map(|_| ())
+        .map_err(|error| format!("could not select Guided mode for drone {drone_id}: {error}"))
+}
+
+/// Same as `arm_throttle`, but for an arbitrary drone.
+pub fn arm_throttle_for(drone_id: u8) -> Result<(), String> {
+    send_command_for(drone_id, MavCmd::MAV_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0)
+        .map_err(|error| format!("could not arm drone {drone_id}: {error}"))
+}
+
+/// Same as `takeoff`, but for an arbitrary drone.
+/// Commands an arbitrary drone to return to its launch point.
+pub fn return_to_launch_for(drone_id: u8) -> Result<(), String> {
+    send_command_for(drone_id, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH, 0.0, 0.0)
+        .map_err(|error| format!("could not command RTL for drone {drone_id}: {error}"))
+}
+
+pub fn takeoff_for(drone_id: u8, altitude_m: f32) -> Result<(), String> {
+    send_command_for(drone_id, MavCmd::MAV_CMD_NAV_TAKEOFF, 0.0, altitude_m)
+        .map_err(|error| format!("could not command takeoff for drone {drone_id}: {error}"))
+}
+
+fn send_command_for(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> Result<(), String> {
+    let link = control_link_for(drone_id)?;
+    let header = control_header();
+    let message = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: drone_id,
+        target_component: 1,
+        command,
+        confirmation: 0,
+        param1,
+        param2: 0.0,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7,
+    });
+    link.send(&header, &message)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}

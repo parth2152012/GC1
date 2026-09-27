@@ -1,7 +1,7 @@
-use crate::deep_scan::DroneRole;
 use crate::bat_management::BatteryState;
-use crate::peer::PositionEnu;
+use crate::deep_scan::DroneRole;
 use crate::gps;
+use crate::peer::PositionEnu;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -78,8 +78,18 @@ impl MissionManager {
         id
     }
 
-    pub fn add_poi(&mut self, mission_id: u32, north_m: f64, east_m: f64, alt_m: f32, priority: Priority) -> Result<u32, String> {
-        let mission = self.missions.get_mut(&mission_id).ok_or("mission not found")?;
+    pub fn add_poi(
+        &mut self,
+        mission_id: u32,
+        north_m: f64,
+        east_m: f64,
+        alt_m: f32,
+        priority: Priority,
+    ) -> Result<u32, String> {
+        let mission = self
+            .missions
+            .get_mut(&mission_id)
+            .ok_or("mission not found")?;
         let poi = PointOfInterest {
             id: self.next_poi_id,
             north_m,
@@ -100,7 +110,13 @@ impl MissionManager {
     }
 
     /// Select next PoI for a UAV, honoring priority and availability. Recalculates each call.
-    pub fn select_next_poi_for_uav(&mut self, mission_id: u32, uav: &crate::deep_scan::SwarmNode, origin_lat: f64, origin_lon: f64) -> Option<PointOfInterest> {
+    pub fn select_next_poi_for_uav(
+        &mut self,
+        mission_id: u32,
+        uav: &crate::deep_scan::SwarmNode,
+        origin_lat: f64,
+        origin_lon: f64,
+    ) -> Option<PointOfInterest> {
         let mission = self.missions.get_mut(&mission_id)?;
 
         // UAV must be available
@@ -111,7 +127,11 @@ impl MissionManager {
         // Build candidate queues for each priority level
         for &prio in Priority::all_desc().iter() {
             // find first pending poi with this priority
-            if let Some(idx) = mission.pois.iter().position(|p| matches!(p.state, PoIState::Pending) && p.priority == prio) {
+            if let Some(idx) = mission
+                .pois
+                .iter()
+                .position(|p| matches!(p.state, PoIState::Pending) && p.priority == prio)
+            {
                 // found candidate
                 let mut poi = mission.pois[idx].clone();
 
@@ -127,23 +147,49 @@ impl MissionManager {
         None
     }
 
-    pub fn mark_poi_in_progress(&mut self, mission_id: u32, poi_id: u32, uav_id: u8) -> Result<(), String> {
-        let mission = self.missions.get_mut(&mission_id).ok_or("mission not found")?;
-        let poi = mission.pois.iter_mut().find(|p| p.id == poi_id).ok_or("poi not found")?;
+    pub fn mark_poi_in_progress(
+        &mut self,
+        mission_id: u32,
+        poi_id: u32,
+        uav_id: u8,
+    ) -> Result<(), String> {
+        let mission = self
+            .missions
+            .get_mut(&mission_id)
+            .ok_or("mission not found")?;
+        let poi = mission
+            .pois
+            .iter_mut()
+            .find(|p| p.id == poi_id)
+            .ok_or("poi not found")?;
         poi.state = PoIState::InProgress(uav_id);
         Ok(())
     }
 
     pub fn mark_poi_completed(&mut self, mission_id: u32, poi_id: u32) -> Result<(), String> {
-        let mission = self.missions.get_mut(&mission_id).ok_or("mission not found")?;
-        let poi = mission.pois.iter_mut().find(|p| p.id == poi_id).ok_or("poi not found")?;
+        let mission = self
+            .missions
+            .get_mut(&mission_id)
+            .ok_or("mission not found")?;
+        let poi = mission
+            .pois
+            .iter_mut()
+            .find(|p| p.id == poi_id)
+            .ok_or("poi not found")?;
         poi.state = PoIState::Completed;
         Ok(())
     }
 
     pub fn mark_poi_failed(&mut self, mission_id: u32, poi_id: u32) -> Result<(), String> {
-        let mission = self.missions.get_mut(&mission_id).ok_or("mission not found")?;
-        let poi = mission.pois.iter_mut().find(|p| p.id == poi_id).ok_or("poi not found")?;
+        let mission = self
+            .missions
+            .get_mut(&mission_id)
+            .ok_or("mission not found")?;
+        let poi = mission
+            .pois
+            .iter_mut()
+            .find(|p| p.id == poi_id)
+            .ok_or("poi not found")?;
         if poi.attempts >= self.max_attempts_per_poi {
             poi.state = PoIState::Failed;
         } else {
@@ -152,7 +198,37 @@ impl MissionManager {
         Ok(())
     }
 
-    pub fn uav_available(uav: &crate::deep_scan::SwarmNode, assignment_battery_threshold: f32) -> bool {
+    /// FIX: previously nothing ever released a PoI that was `Assigned`/`InProgress` on
+    /// a UAV that has since become unavailable (RTL, battery-critical, comms lost) —
+    /// `select_next_poi_for_uav` only ever considers `Pending` PoIs, so such a PoI
+    /// would stay permanently stuck to a UAV that can no longer complete it, and no
+    /// other UAV could ever pick it up. The caller (the orchestrator loop in main.rs)
+    /// is responsible for detecting that a UAV holding a `current_poi` has become
+    /// unavailable and calling this to put the PoI back into circulation.
+    ///
+    /// This does not count against `max_attempts_per_poi` / does not risk marking the
+    /// PoI `Failed`, since the interruption was caused by the UAV, not by anything
+    /// wrong with the PoI itself.
+    pub fn release_stalled_poi(&mut self, mission_id: u32, poi_id: u32) -> Result<(), String> {
+        let mission = self
+            .missions
+            .get_mut(&mission_id)
+            .ok_or("mission not found")?;
+        let poi = mission
+            .pois
+            .iter_mut()
+            .find(|p| p.id == poi_id)
+            .ok_or("poi not found")?;
+        if matches!(poi.state, PoIState::Assigned(_) | PoIState::InProgress(_)) {
+            poi.state = PoIState::Pending;
+        }
+        Ok(())
+    }
+
+    pub fn uav_available(
+        uav: &crate::deep_scan::SwarmNode,
+        assignment_battery_threshold: f32,
+    ) -> bool {
         if uav.role == DroneRole::ReturnToBase || uav.role == DroneRole::ReservePool {
             return false;
         }
@@ -169,11 +245,25 @@ impl MissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deep_scan::{SwarmNode, DroneRole};
     use crate::bat_management::BatteryState;
+    use crate::deep_scan::{DroneRole, SwarmNode};
 
     fn make_node(id: u8, role: DroneRole, percent: f32) -> SwarmNode {
-        SwarmNode { id, role, position_enu: PositionEnu { east_m: 0.0, north_m: 0.0, up_m: 0.0 }, battery: BatteryState { percentage: percent, discharge_rate_per_min: 5.0 } }
+        SwarmNode {
+            id,
+            role,
+            position_enu: PositionEnu {
+                east_m: 0.0,
+                north_m: 0.0,
+                up_m: 0.0,
+            },
+            battery: BatteryState {
+                percentage: percent,
+                discharge_rate_per_min: 5.0,
+            },
+            current_poi: None,
+            airborne_since: None,
+        }
     }
 
     #[test]
@@ -185,7 +275,9 @@ mod tests {
         let _ = mgr.add_poi(mid, 30.0, 0.0, 10.0, Priority::Medium);
 
         let uav = make_node(1, DroneRole::LeadSurveyor, 100.0);
-        let poi = mgr.select_next_poi_for_uav(mid, &uav, 0.0, 0.0).expect("should assign high priority first");
+        let poi = mgr
+            .select_next_poi_for_uav(mid, &uav, 0.0, 0.0)
+            .expect("should assign high priority first");
         assert_eq!(poi.priority, Priority::High);
     }
 
@@ -239,10 +331,38 @@ mod tests {
         let poi = mgr.select_next_poi_for_uav(mid, &uav1, 0.0, 0.0).unwrap();
         assert_eq!(poi.id, id);
 
-        // Simulate uav1 becoming unavailable (return to base)
+        // Simulate uav1 becoming unavailable (return to base) mid-flight. This mirrors
+        // what the orchestrator loop in main.rs does: it detects the role transition on
+        // a node still holding a `current_poi` and releases that PoI back to the pool.
         uav1.role = DroneRole::ReturnToBase;
-        // Next call should allow reassignment since the assigned UAV is unavailable
+        mgr.release_stalled_poi(mid, id).unwrap();
+
+        // Now reassignment to a different, available UAV should succeed.
         let poi2 = mgr.select_next_poi_for_uav(mid, &uav2, 0.0, 0.0).unwrap();
         assert_eq!(poi2.id, id);
+    }
+
+    #[test]
+    fn release_stalled_poi_is_a_noop_for_pending_or_completed() {
+        let mut mgr = MissionManager::new();
+        let mid = mgr.create_mission();
+        let id = mgr.add_poi(mid, 10.0, 0.0, 10.0, Priority::High).unwrap();
+
+        // Pending PoI: releasing it should not error and should leave it assignable.
+        mgr.release_stalled_poi(mid, id).unwrap();
+        let uav = make_node(1, DroneRole::LeadSurveyor, 100.0);
+        let poi = mgr.select_next_poi_for_uav(mid, &uav, 0.0, 0.0).unwrap();
+        assert_eq!(poi.id, id);
+
+        mgr.mark_poi_in_progress(mid, id, uav.id).unwrap();
+        mgr.mark_poi_completed(mid, id).unwrap();
+
+        // Completed PoI: releasing it must not resurrect it as Pending.
+        mgr.release_stalled_poi(mid, id).unwrap();
+        let pois = mgr.get_all_pois(mid).unwrap();
+        assert!(matches!(
+            pois.iter().find(|p| p.id == id).unwrap().state,
+            PoIState::Completed
+        ));
     }
 }

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
+use crate::metrics;
+
 const MAX_DATAGRAM_SIZE: usize = 1400;
 const HEADER_SIZE: usize = 12;
 const FRAME_TTL: Duration = Duration::from_secs(2);
@@ -58,8 +60,27 @@ pub async fn start_listener() {
         if frame.received == total {
             let frame = frames.remove(&frame_id).expect("frame exists");
             let jpeg: Vec<u8> = frame.chunks.into_iter().flatten().flatten().collect();
-            // Forward `jpeg` to the mesh/vision pipeline. It was reassembled only after all chunks arrived.
-            let _ = jpeg;
+
+            // FIX: this used to be `let _ = jpeg;` — the reassembled image evidence was
+            // decoded and then thrown away, even though the proposal's own §5.1/§9
+            // treat imagery collection as a core mission requirement. Now it is saved
+            // to disk and logged as a metrics event so a run's captured evidence is
+            // actually reviewable/reproducible.
+            let bytes = jpeg.len();
+            let path = format!("captures/frame_{frame_id}.jpg");
+            if let Err(error) = tokio::fs::create_dir_all("captures").await {
+                eprintln!("⚠️  Could not create captures directory: {error}");
+            } else if let Err(error) = tokio::fs::write(&path, &jpeg).await {
+                eprintln!("⚠️  Could not save captured frame to {path}: {error}");
+            } else {
+                println!("📸 Saved captured frame #{frame_id} ({bytes} bytes) to {path}");
+            }
+            metrics::log_event(metrics::MetricEvent::PhotoCaptured {
+                frame_id,
+                bytes,
+                path,
+            })
+            .await;
         }
     }
 }
