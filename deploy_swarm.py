@@ -23,8 +23,9 @@ def cleanup():
 def main():
     cleanup()
 
-    # Suppress Qt environment warnings in GUI subshells
-    os.environ["QT_XKB_CONFIG_ROOT"] = "/usr/share/X11/xkb"
+    # Suppress the harmless Qt compose-table diagnostic printed by some
+    # qterminal/X11 builds. It is unrelated to SITL or the Rust controller.
+    os.environ["QT_LOGGING_RULES"] = "qt.xkb.compose.warning=false"
 
     print("==================================================")
     print("📍 SWARM LOCATION CONFIGURATION")

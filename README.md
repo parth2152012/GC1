@@ -8,7 +8,7 @@ UVAX-1 is an async Rust controller for a two-node ArduCopter SITL swarm. It rece
 
 - MAVLink telemetry listeners for Drone 1 (`UDP 14550`) and Drone 2 (`UDP 14560`).
 - An operator CLI available as soon as the controller starts.
-- **Autonomous multi-PoI mission planning**: 10 PoIs are spawned at random positions/times across the 45-minute mission window (matching the organizer's sample scenario), prioritized (High/Medium/Low), and automatically assigned + flown to by whichever drone currently holds the `LeadSurveyor` role — including the reserve drone after a relay handoff.
+- **Autonomous multi-PoI mission planning**: 10 PoIs are spawned at random positions across the 45-minute mission window (the first two are released immediately after GPS lock so a demo does not sit at `0/0`; the remaining PoIs emerge at random times), prioritized (High/Medium/Low), and automatically assigned + flown to by whichever drone currently holds the `LeadSurveyor` role — including the reserve drone after a relay handoff.
 - **Generalized flight control**: both Drone 1 and Drone 2 can be commanded over MAVLink (`send_guided_target_for`, etc.), not just Drone 1, so a promoted reserve is actually flown, not just relabeled.
 - **Real collision-avoidance action**: a 20 m separation breach now triggers a corrective nudge command (not just a log warning), rate-limited to avoid command spam.
 - **Measured metrics logging**: packet identities, send/receive timestamps, measured latency samples, mission progress, relay reallocations, recovery time, separation/link warnings, avoidance maneuvers, photo captures, mesh health, and fault injections are appended as JSON lines to `swarm_metrics.jsonl`.

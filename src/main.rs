@@ -107,10 +107,17 @@ fn spawn_random_pois(
 ) -> Vec<PendingPoi> {
     let now = Instant::now();
     (0..count)
-        .map(|_| {
+        .map(|index| {
             let north_m = (rng.next_f64() * 2.0 - 1.0) * half_extent_m;
             let east_m = (rng.next_f64() * 2.0 - 1.0) * half_extent_m;
-            let delay_s = rng.next_f64() * window.as_secs_f64();
+            // Keep the demo visibly active immediately after GPS lock. The
+            // remaining PoIs still arrive at random times across the benchmark
+            // window, preserving the emerging-PoI behavior.
+            let delay_s = if index < 2 {
+                0.0
+            } else {
+                rng.next_f64() * window.as_secs_f64()
+            };
             let priority = match rng.next_u64() % 3 {
                 0 => mission::Priority::High,
                 1 => mission::Priority::Medium,
