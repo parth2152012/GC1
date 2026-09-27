@@ -1,109 +1,68 @@
-# 🚁 UVAX-1: Deep Scan Protocol
+# UVAX-1: Deep Scan Protocol
 
-UVAX-1 is an async Rust controller for a two-node ArduCopter SITL swarm. It receives MAVLink telemetry, autonomously assigns and dispatches PoIs, tracks swarm safety/battery state, performs a corrective collision-avoidance maneuver, logs standardized metrics, supports fault injection for testing, accepts operator commands, and reassembles + saves camera-image datagrams.
+Rust/Tokio controller for 1–20 ArduCopter SITL vehicles, with autonomous POI allocation and UDP relay forwarding. This is a simulator prototype; it is not a certified implementation of every sample-scenario constraint.
 
-> This is a research/SITL project. Validate configuration and safety constraints before connecting it to a real aircraft.
+## Run
 
-## What works
+Requires Rust, Python 3, ArduPilot SITL, and MAVProxy. The graphical launcher also needs `qterminal` or `x-terminal-emulator`.
 
-- MAVLink telemetry listeners for Drone 1 (`UDP 14550`) and Drone 2 (`UDP 14560`).
-- An operator CLI available as soon as the controller starts.
-- **Autonomous multi-PoI mission planning**: 10 PoIs are spawned at random positions across the 45-minute mission window (the first two are released immediately after GPS lock so a demo does not sit at `0/0`; the remaining PoIs emerge at random times), prioritized (High/Medium/Low), and automatically assigned + flown to by whichever drone currently holds the `LeadSurveyor` role — including the reserve drone after a relay handoff.
-- **Generalized flight control**: both Drone 1 and Drone 2 can be commanded over MAVLink (`send_guided_target_for`, etc.), not just Drone 1, so a promoted reserve is actually flown, not just relabeled.
-- **Real collision-avoidance action**: a 20 m separation breach now triggers a corrective nudge command (not just a log warning), rate-limited to avoid command spam.
-- **Measured metrics logging**: packet identities, send/receive timestamps, measured latency samples, mission progress, relay reallocations, recovery time, separation/link warnings, avoidance maneuvers, photo captures, mesh health, and fault injections are appended as JSON lines to `swarm_metrics.jsonl`.
-- **Fault injection for testing**: `fail battery <1|2> <percent>` and `fail link` / `recover` let you simulate a UAV or comms failure and measure recovery time.
-- GPS-gated `poi` commands, bounded to ±500 m north/east and 0–100 m relative altitude (matches the organizer's 100 m operational height cap).
-- A bidirectional MAVLink control route through dedicated MAVProxy TCP outputs (ports 14600, 14601, ...), avoiding contention with MAVProxy's own SITL connection.
-- On-demand camera snapshots: `snap` signals `camera.py` on `UDP 5002`; captured JPEG fragments are reassembled and **saved to `captures/frame_<id>.jpg`** (previously discarded).
-
-## Requirements
-
-- Rust toolchain (edition 2021).
-- Python 3; `camera.py` additionally needs `opencv-python` and a working webcam.
-- An ArduPilot checkout with `Tools/autotest/sim_vehicle.py`.
-- A graphical terminal such as `qterminal` or `x-terminal-emulator` when using `deploy_swarm.py`.
-
-## Start a local SITL swarm
-
-`deploy_swarm.py` starts two visible ArduCopter SITL instances and runs the Rust controller in the current terminal. Update `ARDUPILOT_DIR` and `RUST_APP_DIR` at the top of the script if your checkouts are elsewhere.
-
-```bash
-cd /path/to/GC1
+```sh
 python3 deploy_swarm.py
 ```
 
-The launcher prompts for the ArduPilot checkout (press Enter for `~/ardupilot`), the drone count, and an origin. Drones are placed 5 m apart north/south; their telemetry ports begin at UDP 14550 and increase by 10 per drone. The controller currently displays telemetry for the first two drones.
+Choose a count from 1 to 20. The launcher passes that count to the controller. To start the controller separately with existing simulators:
 
-To also enable `snap`, start the camera producer in another terminal before running the controller:
-
-```bash
-python3 camera.py
+```sh
+GC1_DRONE_COUNT=20 cargo run
 ```
 
-Alternatively, `deploy_swarm.sh` starts `camera.py` automatically when it is run from the repository root.
+Ports for vehicle ID `id`:
 
-## Operator CLI
+- Telemetry: UDP `14550 + 10*(id-1)`.
+- MAVProxy control: TCP `14600 + (id-1)`.
+- Radio relay endpoint: UDP `16000 + id`; operational center: UDP `16000`.
+
+Telemetry freshness, command serialization, battery state, flight jobs, POI ownership, and return-to-launch state are maintained per vehicle. Takeoff/command acknowledgement waits run independently so one drone cannot block the fleet loop. Setup failures release POIs for retry. Guided navigation requests a 4.5 m/s speed setting, but the live run still exceeded 5 m/s; this is not a verified speed cap.
+
+## Operator commands
 
 ```text
-swarm-cli> help
-Commands: mode guided | arm throttle | takeoff <alt_m> | poi <north_m> <east_m> <alt_m> | snap | status | fail battery <1|2> <percent> | fail link | recover | help
-
-swarm-cli> status
---- FLEET TELEMETRY STATUS ---
-🛸 Drone 1: Pos (19.076000, 72.877700) | Bat: 100%
-🛸 Drone 2: Pos (19.076090, 72.877700) | Bat: 100%
-
-swarm-cli> poi 200 85 15
-🎯 Dispatched target: North 200m, East 85m (...)
-
-swarm-cli> fail battery 1 12
-💥 Injected battery fault on Drone 1 -> 12%
-
-swarm-cli> snap
-📸 TRIGGERING CAMERA SNAPSHOT CAPTURE...
+drone 20
+mode guided
+arm throttle
+takeoff 15
+poi 40 20 15
+status
+fail battery 20 10
+fail link
+recover
 ```
 
-### Command reference
+`drone <id>` selects the vehicle for mode, arm, takeoff and POI commands; the default is Drone 1. `status` prints the whole configured fleet. Manual POI offsets are relative to the selected vehicle's current position. Targets are rejected while that vehicle has a flight setup job or is returning. `recover` clears link and battery fault overrides. `snap`/`image` still requests a frame from `camera.py`.
 
-| Command | Description |
-| --- | --- |
-| `poi <north_m> <east_m> <alt_m>` | Sets Guided mode, arms/takes off if needed, then sends Drone 1 a global-relative-altitude target. |
-| `mode guided` | Sets Drone 1 to ArduCopter Guided mode. |
-| `arm throttle` | Arms Drone 1. Complete pre-arm checks and use this only in a safe SITL/test environment. |
-| `takeoff <alt_m>` | Sets Guided mode, arms Drone 1, then commands takeoff to 0–100 m relative altitude. |
-| `status` | Prints the latest position and battery values from both telemetry streams. |
-| `snap` / `image` | Requests one JPEG frame from `camera.py`, saved to `captures/`. |
-| `fail battery <1\|2> <percent>` | Injects a battery fault on a drone, for testing reconfiguration/recovery-time measurement. |
-| `fail link` | Simulates a mesh communications outage (dropped packets). |
-| `recover` | Clears a simulated link outage. |
-| `help` | Prints the command summary. |
+## Actual packet hops in SITL
 
-Meanwhile, in the background, the orchestrator autonomously spawns PoIs, assigns them to whichever drone is currently `LeadSurveyor`, flies to them, marks them complete on arrival, and logs everything to `swarm_metrics.jsonl`.
+`src/radio.rs` binds one UDP socket per vehicle and one for the center. The source computes a route from fresh telemetry. Every intermediate node receives and forwards the packet through its own socket. Every incoming and outgoing hop must be at most 100 m; positions older than three seconds are excluded. A missing route fails delivery instead of bypassing the range restriction through localhost. The center returns an acknowledgement over the reverse path; each report attempt has a ten-second timeout. `fail link` stops forwarding.
 
-## Metrics log
+The mission allocator deploys available vehicles along approximately 75 m relay corridors and assigns an endpoint surveyor. Arrival alone does not complete a POI: the center must acknowledge its report. The fleet retries reports when routes are unavailable. The old self-addressed mesh heartbeat is no longer started.
 
-`swarm_metrics.jsonl` (one JSON object per line) is written next to the binary and contains a timestamped, typed event stream: `MissionStart`, `MissionProgress`, `PoiAssigned`, `PoiCompleted`, `RelayReallocation`, `RecoveryTime`, `SeparationBreach`, `LinkWarning`, `CollisionAvoidanceManeuver`, `PhotoCaptured`, `FaultInjected`, `MeshStatus`. This is the basis for filling in the official Evaluation & Performance Metrics table (mission completion rate/time, relay reallocations, recovery time, collision count, etc.) — aggregate it with a short offline script per run.
+This is actual UDP forwarding with simulated radio reachability, not physical RF. All endpoints run as separate async tasks in the controller process. Flight-control MAVLink and telemetry still use dedicated direct MAVProxy connections; POI reports use the multi-hop path. No claim is made that commands or images traverse this mesh.
 
-## Development checks
+## Tests
 
-```bash
-cargo fmt --check
-cargo test
-python3 -m py_compile camera.py deploy_swarm.py
+```sh
+cargo test --offline
+cargo build --offline
+python3 scripts/test_sitl_scenario.py --drones 20 --seconds 120
 ```
 
-Note: `cargo test` now also runs `mission.rs`'s test suite, which previously never compiled because the module wasn't declared in `main.rs`.
+Socket tests require local networking permission. They check twenty-hop delivery and that removing an essential relay prevents delivery until it returns. The headless harness requires `pymavlink`, `mavproxy.py`, and a built SITL under `~/ardupilot` (override using `--ardupilot`). It starts only its own simulator processes and writes raw telemetry, controller logs, and results to the printed `/tmp/gc1-sitl-*` directory before stopping those processes.
 
-The controller enforces the 45-minute mission deadline: it stops spawning/dispatching PoIs and sends both SITL vehicles RTL when the deadline is reached.
+## Remaining scenario limits
 
-## Known remaining limitations
-
-- Still fundamentally a 2-node prototype (`node_active`/`node_reserve`); a true N-UAV swarm would need `Vec<SwarmNode>` and a generalized WaveManager.
-- The mesh has no acknowledgement/retransmission or route-quality optimization. Its measured PDR/latency currently covers the controller's local heartbeat health probe; an end-to-end UAV-to-GCS PDR requires separate per-drone application traffic.
-- The demo script now exercises battery handoff, link outage/recovery, optional camera capture, and final metrics aggregation; a full Stage-2 scenario harness is still not implemented.
-- `discharge_rate_per_min` is still a fixed constant rather than measured from telemetry, so endurance estimates are approximate.
-
-## License
-
-Developed for academic research, competitive benchmarking, and participation in the PUSHPAK National Mission on Drone Technology challenge.
+- Relay corridor planning is simple; it does not guarantee collision-free trajectories or repair every failed airborne relay. Launch spacing remains 5 m, and the 20 m separation requirement is not guaranteed.
+- Small fleets may lack enough vehicles for a long relay corridor; such POIs wait for capacity.
+- A disconnected report can exceed ten seconds from first detection even though individual attempts time out at ten seconds.
+- RTL is requested with a distance-based return margin before flight/mission limits; full 20-minute endurance and 45-minute landing compliance still require a complete scenario test.
+- The arena is centered on Drone 1's origin; the sample diagram's operational-center offset is not modeled.
+- Historical baseline results in `reports/sitl_10_drone_results.*` describe the earlier two-node controller, not this fleet implementation.

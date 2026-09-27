@@ -1,168 +1,128 @@
 use mavlink::common::{
-    MavCmd, MavMessage, MavMode, PositionTargetTypemask, COMMAND_LONG_DATA, SET_MODE_DATA,
+    MavCmd, MavMessage, MavResult, PositionTargetTypemask, COMMAND_LONG_DATA,
     SET_POSITION_TARGET_GLOBAL_INT_DATA,
 };
 use mavlink::error::MessageReadError;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const DEFAULT_CONTROL_PORT_BASE: u16 = 14600;
-const COMMAND_SETTLE_DELAY: Duration = Duration::from_millis(500);
-const ARM_SETTLE_DELAY: Duration = Duration::from_secs(1);
+pub const MAX_DRONES: usize = 20;
+static CONTROL_LOCKS: [std::sync::Mutex<()>; MAX_DRONES] =
+    [const { std::sync::Mutex::new(()) }; MAX_DRONES];
+static FLEET_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub static LATITUDE_1: AtomicI32 = AtomicI32::new(0);
-pub static LONGITUDE_1: AtomicI32 = AtomicI32::new(0);
-pub static ALTITUDE_1_MM: AtomicI32 = AtomicI32::new(0);
-pub static BATTERY_1: AtomicU8 = AtomicU8::new(100);
-
-pub static LATITUDE_2: AtomicI32 = AtomicI32::new(0);
-pub static LONGITUDE_2: AtomicI32 = AtomicI32::new(0);
-pub static ALTITUDE_2_MM: AtomicI32 = AtomicI32::new(0);
-pub static BATTERY_2: AtomicU8 = AtomicU8::new(100);
-
-pub async fn start_telemetry_loop() {
-    println!("📡 Dual MAVLink telemetry listeners active (14550 & 14560)...");
-
-    tokio::task::spawn_blocking(move || {
-        listen_mavlink(
-            "udpin:127.0.0.1:14550",
-            &LATITUDE_1,
-            &LONGITUDE_1,
-            &ALTITUDE_1_MM,
-            &BATTERY_1,
-        );
-    });
-
-    tokio::task::spawn_blocking(move || {
-        listen_mavlink(
-            "udpin:127.0.0.1:14560",
-            &LATITUDE_2,
-            &LONGITUDE_2,
-            &ALTITUDE_2_MM,
-            &BATTERY_2,
-        );
-    });
+pub struct Telemetry {
+    pub lat: AtomicI32,
+    pub lon: AtomicI32,
+    pub altitude_mm: AtomicI32,
+    pub battery: AtomicU8,
+    pub battery_override: AtomicI32,
+    updated_ms: std::sync::atomic::AtomicU64,
 }
-
-fn listen_mavlink(
-    endpoint: &str,
-    lat_store: &'static AtomicI32,
-    lon_store: &'static AtomicI32,
-    alt_store: &'static AtomicI32,
-    bat_store: &'static AtomicU8,
-) {
-    let mut link = match mavlink::connect::<MavMessage>(endpoint) {
-        Ok(conn) => conn,
+impl Telemetry {
+    const fn new() -> Self {
+        Self {
+            lat: AtomicI32::new(0),
+            lon: AtomicI32::new(0),
+            altitude_mm: AtomicI32::new(0),
+            battery: AtomicU8::new(100),
+            battery_override: AtomicI32::new(-1),
+            updated_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    pub fn fresh(&self) -> bool {
+        let stamp = self.updated_ms.load(Ordering::Acquire);
+        stamp != 0 && now_ms().saturating_sub(stamp) < 3000
+    }
+    pub fn battery_percent(&self) -> f32 {
+        let injected = self.battery_override.load(Ordering::Acquire);
+        if injected >= 0 {
+            injected as f32
+        } else {
+            self.battery.load(Ordering::Acquire) as f32
+        }
+    }
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+static TELEMETRY: [Telemetry; MAX_DRONES] = [const { Telemetry::new() }; MAX_DRONES];
+pub fn configure(count: usize) -> Result<(), String> {
+    if !(1..=MAX_DRONES).contains(&count) {
+        return Err("drone count must be 1..=20".into());
+    }
+    FLEET_SIZE
+        .set(count)
+        .map_err(|_| "fleet already configured".into())
+}
+pub fn fleet_size() -> usize {
+    *FLEET_SIZE.get().unwrap_or(&2)
+}
+pub fn telemetry(id: u8) -> &'static Telemetry {
+    &TELEMETRY[id as usize - 1]
+}
+fn control_lock(id: u8) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    if id == 0 || id as usize > fleet_size() {
+        return Err(format!("Unsupported drone ID {id}"));
+    }
+    CONTROL_LOCKS[id as usize - 1]
+        .lock()
+        .map_err(|e| e.to_string())
+}
+pub async fn start_telemetry_loop() {
+    println!("Telemetry listeners starting for {} drones", fleet_size());
+    for id in 1..=fleet_size() as u8 {
+        tokio::task::spawn_blocking(move || listen_mavlink(id));
+    }
+}
+fn listen_mavlink(id: u8) {
+    let endpoint = format!("udpin:127.0.0.1:{}", 14550 + 10 * (id as u16 - 1));
+    let mut link = match mavlink::connect::<MavMessage>(&endpoint) {
+        Ok(link) => link,
         Err(e) => {
-            eprintln!(
-                "❌ Failed to connect to MAVLink endpoint {}: {:?}",
-                endpoint, e
-            );
+            eprintln!("Drone {id} telemetry bind failed: {e}");
             return;
         }
     };
-
-    let _ = link.set_protocol_version(mavlink::MavlinkVersion::V2);
-
+    link.set_protocol_version(mavlink::MavlinkVersion::V2);
+    let state = telemetry(id);
     loop {
         match link.recv() {
-            Ok((_header, msg)) => match msg {
+            Ok((header, message)) if header.system_id == id => match message {
                 MavMessage::GLOBAL_POSITION_INT(data) => {
-                    lat_store.store(data.lat, Ordering::Release);
-                    lon_store.store(data.lon, Ordering::Release);
-                    alt_store.store(data.relative_alt, Ordering::Release);
+                    state.lat.store(data.lat, Ordering::Release);
+                    state.lon.store(data.lon, Ordering::Release);
+                    state
+                        .altitude_mm
+                        .store(data.relative_alt, Ordering::Release);
+                    state.updated_ms.store(now_ms(), Ordering::Release);
                 }
-                MavMessage::SYS_STATUS(data) => {
-                    if data.battery_remaining >= 0 {
-                        bat_store.store(data.battery_remaining as u8, Ordering::Release);
-                    }
+                MavMessage::SYS_STATUS(data) if data.battery_remaining >= 0 => {
+                    state
+                        .battery
+                        .store(data.battery_remaining as u8, Ordering::Release);
                 }
                 _ => {}
             },
-            Err(MessageReadError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(MessageReadError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            _ => {}
         }
     }
 }
 
-/// Sends a guided target through MAVProxy's dedicated bidirectional TCP output.
-///
-/// The UDP telemetry ports are one-way `--out` destinations used by the listeners,
-/// so writing a command back to them only sends it to another local UDP socket. SITL
-/// also has a single-client TCP endpoint already occupied by MAVProxy. The launcher
-/// therefore exposes separate MAVProxy `tcpin` outputs starting at port 14600.
-pub fn send_guided_target(target_lat: f64, target_lon: f64, alt_m: f32) -> Result<(), String> {
-    let link = control_link()?;
-
-    let header = mavlink::MavHeader {
-        system_id: 255,
-        component_id: 190,
-        sequence: 0,
-    };
-
-    let set_pos_msg =
-        MavMessage::SET_POSITION_TARGET_GLOBAL_INT(SET_POSITION_TARGET_GLOBAL_INT_DATA {
-            time_boot_ms: 0,
-            target_system: 1,
-            target_component: 1,
-            coordinate_frame: mavlink::common::MavFrame::MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-            type_mask: PositionTargetTypemask::from_bits_truncate(0b0000111111111000),
-            lat_int: (target_lat * 1e7) as i32,
-            lon_int: (target_lon * 1e7) as i32,
-            alt: alt_m,
-            vx: 0.0,
-            vy: 0.0,
-            vz: 0.0,
-            afx: 0.0,
-            afy: 0.0,
-            afz: 0.0,
-            yaw: 0.0,
-            yaw_rate: 0.0,
-        });
-
-    link.send(&header, &set_pos_msg)
-        .map(|_| ())
-        .map_err(|error| format!("could not send guided target: {error}"))
-}
-
-/// Selects ArduCopter Guided mode for Drone 1.
+/// Select Guided mode for Drone 1 and wait for the autopilot acknowledgement.
 pub fn set_guided_mode() -> Result<(), String> {
-    let link = control_link()?;
-    let header = control_header();
-    let message = MavMessage::SET_MODE(SET_MODE_DATA {
-        target_system: 1,
-        base_mode: MavMode::MAV_MODE_GUIDED_DISARMED,
-        // ArduCopter's custom mode number for Guided.
-        custom_mode: 4,
-    });
-
-    link.send(&header, &message)
-        .map(|_| ())
-        .map_err(|error| format!("could not select Guided mode: {error}"))
+    set_guided_mode_for(1)
 }
 
-/// Arms Drone 1 using the MAVLink arm/disarm command.
 pub fn arm_throttle() -> Result<(), String> {
-    send_command(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0)
-        .map_err(|error| format!("could not arm throttle: {error}"))
-}
-
-/// Commands Drone 1 to take off to a relative altitude in metres.
-pub fn takeoff(altitude_m: f32) -> Result<(), String> {
-    send_command(MavCmd::MAV_CMD_NAV_TAKEOFF, 0.0, altitude_m)
-        .map_err(|error| format!("could not command takeoff: {error}"))
-}
-
-fn control_link() -> Result<Box<dyn mavlink::MavConnection<MavMessage> + Send>, String> {
-    control_link_for(1)
+    arm_throttle_for(1)
 }
 
 fn control_header() -> mavlink::MavHeader {
@@ -172,37 +132,6 @@ fn control_header() -> mavlink::MavHeader {
         sequence: 0,
     }
 }
-
-fn send_command(command: MavCmd, param1: f32, param7: f32) -> Result<(), String> {
-    let link = control_link()?;
-    let header = control_header();
-    let message = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: 1,
-        target_component: 1,
-        command,
-        confirmation: 0,
-        param1,
-        param2: 0.0,
-        param3: 0.0,
-        param4: 0.0,
-        param5: 0.0,
-        param6: 0.0,
-        param7,
-    });
-
-    link.send(&header, &message)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-// ---------------------------------------------------------------------------------
-// FIX: the functions above only ever command Drone 1 (hardcoded endpoint, sysid 1).
-// That meant that once WaveManager promoted the reserve (Drone 2) to LeadSurveyor,
-// nothing in the codebase could actually fly it — the "relay handoff" was only a
-// role label, never a real command. The functions below route each system ID through
-// its corresponding MAVProxy TCP output so the mission-dispatch loop in main.rs can
-// command whichever node currently holds the LeadSurveyor role.
-// ---------------------------------------------------------------------------------
 
 fn control_endpoint_for(drone_id: u8) -> String {
     let base = std::env::var("GC1_CONTROL_PORT_BASE")
@@ -224,14 +153,14 @@ fn control_link_for(
     Ok(link)
 }
 
-/// Same as `send_guided_target`, but for an arbitrary drone (by 1-based ID) instead
-/// of always Drone 1.
+/// Send a position target through the drone's dedicated MAVProxy TCP output.
 pub fn send_guided_target_for(
     drone_id: u8,
     target_lat: f64,
     target_lon: f64,
     alt_m: f32,
 ) -> Result<(), String> {
+    let _guard = control_lock(drone_id)?;
     let link = control_link_for(drone_id)?;
     let header = control_header();
     let set_pos_msg =
@@ -261,16 +190,8 @@ pub fn send_guided_target_for(
 
 /// Same as `set_guided_mode`, but for an arbitrary drone.
 pub fn set_guided_mode_for(drone_id: u8) -> Result<(), String> {
-    let link = control_link_for(drone_id)?;
-    let header = control_header();
-    let message = MavMessage::SET_MODE(SET_MODE_DATA {
-        target_system: drone_id,
-        base_mode: MavMode::MAV_MODE_GUIDED_DISARMED,
-        custom_mode: 4,
-    });
-    link.send(&header, &message)
-        .map(|_| ())
-        .map_err(|error| format!("could not select Guided mode for drone {drone_id}: {error}"))
+    // ArduCopter requires CUSTOM_MODE_ENABLED (1), not GUIDED_DISARMED (88).
+    send_command_data(guided_mode_command(drone_id))
 }
 
 /// Same as `arm_throttle`, but for an arbitrary drone.
@@ -279,7 +200,6 @@ pub fn arm_throttle_for(drone_id: u8) -> Result<(), String> {
         .map_err(|error| format!("could not arm drone {drone_id}: {error}"))
 }
 
-/// Same as `takeoff`, but for an arbitrary drone.
 /// Commands an arbitrary drone to return to its launch point.
 pub fn return_to_launch_for(drone_id: u8) -> Result<(), String> {
     send_command_for(drone_id, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH, 0.0, 0.0)
@@ -292,44 +212,80 @@ pub fn takeoff_for(drone_id: u8, altitude_m: f32) -> Result<(), String> {
 }
 
 fn relative_altitude_mm_for(drone_id: u8) -> i32 {
-    match drone_id {
-        1 => ALTITUDE_1_MM.load(Ordering::Acquire),
-        2 => ALTITUDE_2_MM.load(Ordering::Acquire),
-        _ => 0,
-    }
+    telemetry(drone_id).altitude_mm.load(Ordering::Acquire)
 }
 
-/// Select Guided mode, arm, and initiate takeoff in the order ArduCopter requires.
+/// Each setup command must be accepted before the next is sent.
 pub async fn prepare_and_takeoff_for(drone_id: u8, altitude_m: f32) -> Result<(), String> {
-    set_guided_mode_for(drone_id)?;
-    sleep(COMMAND_SETTLE_DELAY).await;
-    arm_throttle_for(drone_id)?;
-    sleep(ARM_SETTLE_DELAY).await;
-    takeoff_for(drone_id, altitude_m)
+    if !altitude_m.is_finite() || altitude_m <= 0.0 || altitude_m > 100.0 {
+        return Err("takeoff altitude must be greater than 0 and at most 100m".into());
+    }
+    tokio::task::spawn_blocking(move || {
+        set_guided_mode_for(drone_id)?;
+        arm_throttle_for(drone_id)?;
+        takeoff_for(drone_id, altitude_m)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
-/// Ensure a grounded aircraft takes off before dispatching its PoI target.
+/// Wait for measured climb before sending a position target; a fixed delay can
+/// cancel takeoff while the motors are still spooling up.
 pub async fn prepare_and_send_guided_target_for(
     drone_id: u8,
     target_lat: f64,
     target_lon: f64,
     alt_m: f32,
 ) -> Result<(), String> {
-    set_guided_mode_for(drone_id)?;
-    sleep(COMMAND_SETTLE_DELAY).await;
-    if relative_altitude_mm_for(drone_id) < 2_000 {
-        arm_throttle_for(drone_id)?;
-        sleep(ARM_SETTLE_DELAY).await;
-        takeoff_for(drone_id, alt_m)?;
-        sleep(Duration::from_secs(2)).await;
+    if !target_lat.is_finite()
+        || !target_lon.is_finite()
+        || !alt_m.is_finite()
+        || alt_m <= 0.0
+        || alt_m > 100.0
+    {
+        return Err("target coordinates must be finite and altitude within (0, 100]m".into());
     }
-    send_guided_target_for(drone_id, target_lat, target_lon, alt_m)
+    if relative_altitude_mm_for(drone_id) < 2_000 {
+        prepare_and_takeoff_for(drone_id, alt_m).await?;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let required_mm = (alt_m * 1000.0 * 0.9) as i32;
+        while relative_altitude_mm_for(drone_id) < required_mm {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Drone {drone_id} did not reach takeoff altitude; PoI remains pending"
+                ));
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    } else {
+        tokio::task::spawn_blocking(move || set_guided_mode_for(drone_id))
+            .await
+            .map_err(|error| error.to_string())??;
+    }
+    tokio::task::spawn_blocking(move || {
+        // Groundspeed cap for Guided position navigation.
+        send_command_data(COMMAND_LONG_DATA {
+            param1: 1.0,
+            param2: 4.5,
+            param3: -1.0,
+            ..command_data(drone_id, MavCmd::MAV_CMD_DO_CHANGE_SPEED, 0.0, 0.0)
+        })?;
+        send_guided_target_for(drone_id, target_lat, target_lon, alt_m)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-fn send_command_for(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> Result<(), String> {
-    let link = control_link_for(drone_id)?;
-    let header = control_header();
-    let message = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+fn guided_mode_command(drone_id: u8) -> COMMAND_LONG_DATA {
+    COMMAND_LONG_DATA {
+        param1: 1.0, // MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        param2: 4.0, // ArduCopter Guided
+        ..command_data(drone_id, MavCmd::MAV_CMD_DO_SET_MODE, 0.0, 0.0)
+    }
+}
+
+fn command_data(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> COMMAND_LONG_DATA {
+    COMMAND_LONG_DATA {
         target_system: drone_id,
         target_component: 1,
         command,
@@ -341,20 +297,132 @@ fn send_command_for(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> 
         param5: 0.0,
         param6: 0.0,
         param7,
-    });
-    link.send(&header, &message)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    }
+}
+
+fn send_command_for(drone_id: u8, command: MavCmd, param1: f32, param7: f32) -> Result<(), String> {
+    send_command_data(command_data(drone_id, command, param1, param7))
+}
+
+fn send_command_data(data: COMMAND_LONG_DATA) -> Result<(), String> {
+    let _guard = control_lock(data.target_system)?;
+    let link = control_link_for(data.target_system)?;
+    link.send(&control_header(), &MavMessage::COMMAND_LONG(data.clone()))
+        .map_err(|error| error.to_string())?;
+    wait_for_ack(link.as_ref(), &data, COMMAND_TIMEOUT)
+}
+
+fn wait_for_ack(
+    link: &dyn mavlink::MavConnection<MavMessage>,
+    data: &COMMAND_LONG_DATA,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match link.recv() {
+            Ok((header, MavMessage::COMMAND_ACK(ack)))
+                if header.system_id == data.target_system
+                    && header.component_id == data.target_component
+                    && ack.command == data.command =>
+            {
+                match ack.result {
+                    MavResult::MAV_RESULT_ACCEPTED => return Ok(()),
+                    MavResult::MAV_RESULT_IN_PROGRESS => continue,
+                    result => {
+                        return Err(format!(
+                            "Drone {} rejected {:?}: {result:?}",
+                            data.target_system, data.command
+                        ))
+                    }
+                }
+            }
+            Err(MessageReadError::Io(error))
+                if error.kind() != std::io::ErrorKind::WouldBlock
+                    && error.kind() != std::io::ErrorKind::TimedOut =>
+            {
+                return Err(error.to_string())
+            }
+            _ => {}
+        }
+    }
+    Err(format!(
+        "Drone {} did not acknowledge {:?}",
+        data.target_system, data.command
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    struct AckLink(std::sync::Mutex<std::collections::VecDeque<(mavlink::MavHeader, MavMessage)>>);
+
+    impl mavlink::MavConnection<MavMessage> for AckLink {
+        fn recv(&self) -> Result<(mavlink::MavHeader, MavMessage), MessageReadError> {
+            self.0.lock().unwrap().pop_front().ok_or_else(|| {
+                MessageReadError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            })
+        }
+        fn send(
+            &self,
+            _: &mavlink::MavHeader,
+            _: &MavMessage,
+        ) -> Result<usize, mavlink::error::MessageWriteError> {
+            Ok(1)
+        }
+        fn set_protocol_version(&mut self, _: mavlink::MavlinkVersion) {}
+        fn get_protocol_version(&self) -> mavlink::MavlinkVersion {
+            mavlink::MavlinkVersion::V2
+        }
+    }
+
+    fn ack(id: u8, command: MavCmd, result: MavResult) -> (mavlink::MavHeader, MavMessage) {
+        (
+            mavlink::MavHeader {
+                system_id: id,
+                component_id: 1,
+                sequence: 0,
+            },
+            MavMessage::COMMAND_ACK(mavlink::common::COMMAND_ACK_DATA { command, result }),
+        )
+    }
+
     #[test]
-    fn control_endpoints_are_distinct_mavproxy_outputs() {
-        std::env::remove_var("GC1_CONTROL_PORT_BASE");
-        assert_eq!(control_endpoint_for(1), "tcpout:127.0.0.1:14600");
-        assert_eq!(control_endpoint_for(2), "tcpout:127.0.0.1:14601");
+    fn ack_rejection_and_missing_ack_are_errors() {
+        let data = guided_mode_command(1);
+        let link = AckLink(std::sync::Mutex::new(
+            [ack(1, data.command, MavResult::MAV_RESULT_DENIED)].into(),
+        ));
+        assert!(wait_for_ack(&link, &data, COMMAND_TIMEOUT)
+            .unwrap_err()
+            .contains("DENIED"));
+        assert!(wait_for_ack(&link, &data, Duration::ZERO)
+            .unwrap_err()
+            .contains("did not acknowledge"));
+    }
+
+    #[test]
+    fn ack_must_match_drone_and_command_and_finish() {
+        let data = guided_mode_command(2);
+        let link = AckLink(std::sync::Mutex::new(
+            [
+                ack(1, data.command, MavResult::MAV_RESULT_DENIED),
+                ack(2, MavCmd::MAV_CMD_NAV_TAKEOFF, MavResult::MAV_RESULT_DENIED),
+                ack(2, data.command, MavResult::MAV_RESULT_IN_PROGRESS),
+                ack(2, data.command, MavResult::MAV_RESULT_ACCEPTED),
+            ]
+            .into(),
+        ));
+        assert!(wait_for_ack(&link, &data, COMMAND_TIMEOUT).is_ok());
+        assert!(link.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guided_mode_enables_arducopter_custom_mode() {
+        let data = guided_mode_command(2);
+        assert_eq!(data.target_system, 2);
+        assert_eq!(data.command, MavCmd::MAV_CMD_DO_SET_MODE);
+        assert_eq!(data.param1 as u8 & 1, 1);
+        assert_eq!(data.param2, 4.0);
     }
 }

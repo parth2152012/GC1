@@ -46,10 +46,10 @@ def main():
     try:
         drone_input = input("Enter number of drones [2]: ").strip()
         drone_count = int(drone_input) if drone_input else 2
-        if drone_count < 1:
+        if not 1 <= drone_count <= 20:
             raise ValueError
     except ValueError:
-        print("❌ Drone count must be a positive whole number.")
+        print("❌ Drone count must be between 1 and 20.")
         return
 
     try:
@@ -94,7 +94,7 @@ def main():
     os.chdir(RUST_APP_DIR)
 
     try:
-        subprocess.run(["cargo", "run"])
+        subprocess.run(["cargo", "run"], env={**os.environ, "GC1_DRONE_COUNT": str(drone_count)})
     except KeyboardInterrupt:
         print("\n🛑 Shutting down swarm system...")
         cleanup()

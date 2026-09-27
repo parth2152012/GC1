@@ -1,0 +1,129 @@
+{
+  "scenario_pdf": "sample scenario for GC 1.pptx.pdf",
+  "test_type": "Live ArduCopter SITL baseline; unmodified production mission timing and flight parameters",
+  "drones_requested": 10,
+  "duration_seconds": 180.01,
+  "run_error": null,
+  "telemetry_drones": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "controller_assigned_drones": [
+    1
+  ],
+  "spawned_random_pois": 2,
+  "completed_poi_ids": [
+    1,
+    2,
+    3
+  ],
+  "manual_poi_completed": true,
+  "per_drone": {
+    "1": {
+      "samples": 675,
+      "max_altitude_m": 15.092,
+      "max_speed_mps": 9.982063914842461,
+      "max_distance_from_home_m": 394.3479493064039,
+      "airborne": true
+    },
+    "2": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.02054434087311664,
+      "airborne": false
+    },
+    "3": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.030336112922671937,
+      "airborne": false
+    },
+    "4": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.02290952862604011,
+      "airborne": false
+    },
+    "5": {
+      "samples": 676,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.024196558116711276,
+      "airborne": false
+    },
+    "6": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.025539370070799258,
+      "airborne": false
+    },
+    "7": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.036488162566363974,
+      "airborne": false
+    },
+    "8": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.02836033719246023,
+      "airborne": false
+    },
+    "9": {
+      "samples": 675,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.021285932362089373,
+      "airborne": false
+    },
+    "10": {
+      "samples": 676,
+      "max_altitude_m": 0,
+      "max_speed_mps": 0.04242640687119285,
+      "max_distance_from_home_m": 0.02248206355865838,
+      "airborne": false
+    }
+  },
+  "speed_limit_5mps": {
+    "status": "FAIL",
+    "measurement_tolerance_mps": 0.1
+  },
+  "height_limit_100m": {
+    "status": "NO_BREACH_OBSERVED"
+  },
+  "separation_20m": {
+    "minimum_between_airborne_m": null,
+    "launcher_ground_spacing_m": 5,
+    "status": "NOT_EXERCISED"
+  },
+  "radio_hops_100m": {
+    "status": "FAIL_GEOMETRY",
+    "disconnected_airborne_drones": [
+      1
+    ],
+    "note": "Optimistic graph includes all ground vehicles as relays. MAVLink uses unrestricted localhost; no RF emulation."
+  },
+  "arena": {
+    "outside_current_centered_geofence": [],
+    "note": "Controller centers arena on Drone 1; diagram operational-center offset is not modeled."
+  },
+  "flight_limit_20min": "NOT_TESTED",
+  "land_all_by_45min": "NOT_TESTED",
+  "report_to_center_within_10s": "NOT_VERIFIED: no end-to-end per-POI reporting acknowledgements",
+  "launch_layout": "Production launcher baseline: 5m-spaced ground positions near common origin",
+  "full_scenario_pass": false
+}
